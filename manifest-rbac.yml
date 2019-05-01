@@ -1,0 +1,47 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: tag-to-label
+---
+apiVersion: rbac.authorization.k8s.io/v1beta1
+kind: ClusterRole
+metadata:
+  name: tag-to-label
+rules:
+- apiGroups: [""]
+  resources: ["nodes"]
+  verbs: ["get","watch","list", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1beta1
+kind: ClusterRoleBinding
+metadata:
+  name: tag-to-label-viewer
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: tag-to-label
+subjects:
+- kind: ServiceAccount
+  name: tag-to-label
+  namespace: default
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tag-to-label
+spec:
+  selector:
+    matchLabels:
+      app: tag-to-label
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: tag-to-label
+    spec:
+      serviceAccountName: tag-to-label
+      containers:
+      - name: tag-to-label
+        image: duym/tag-to-label:latest
+        imagePullPolicy: Always

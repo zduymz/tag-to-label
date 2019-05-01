@@ -1,0 +1,20 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tag-to-label
+spec:
+  selector:
+    matchLabels:
+      app: tag-to-label
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: tag-to-label
+    spec:
+      serviceAccountName: tag-to-label
+      containers:
+      - name: tag-to-label
+        image: duym/tag-to-label:latest
+        imagePullPolicy: Always
