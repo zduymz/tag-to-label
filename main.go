@@ -36,7 +36,7 @@ func main() {
 	// (client kubernetes.Interface, defaultResync time.Duration)
 	kubeInformerFactory := kubeinformers.NewSharedInformerFactory(kubeClient, time.Second*30)
 
-	controller, err := controller.NewController(kubeInformerFactory.Core().V1().Nodes(), kubeClient, &config)
+	controller, err := controller.NewController(kubeInformerFactory.Core().V1().Nodes(), kubeInformerFactory.Core().V1().Pods(), kubeClient, &config)
 	if err != nil {
 		klog.Fatalf("Error building kubernetes controller: %s", err.Error())
 	}

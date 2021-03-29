@@ -3,7 +3,7 @@
 
 NAME ?= tag-to-label
 LDFLAGS ?= -X=main.version=$(VERSION) -w -s
-VERSION ?= $(shell git describe --tags --always --dirty)
+VERSION ?= 1.19
 BUILD_FLAGS ?= -v
 CGO_ENABLED ?= 0
 
@@ -15,9 +15,8 @@ linux:
 	GOOS=linux GOARCH=amd64 CGO_ENABLED=${CGO_ENABLED} go build -o build/linux/${NAME} ${BUILD_FLAGS} -ldflags "$(LDFLAGS)" $^
 
 docker: linux
-	docker build --no-cache --squash --rm -t ${NAME}:latest .
-	docker tag ${NAME}:latest duym/${NAME}:latest
-	docker push duym/${NAME}:latest
+	docker build --no-cache --squash --rm -t duym/${NAME}:${VERSION} .
+	docker push duym/${NAME}:${VERSION}
 
 run:
 	./build/macos/${NAME} -kubeconfig=./staging.config -aws.creds=/Users/dmai/.aws/credentials

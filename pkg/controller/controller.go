@@ -1,11 +1,13 @@
 package controller
 
 import (
+	"context"
 	"fmt"
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/zduymz/tag-to-label/pkg/apis/tag-to-label"
 	"github.com/zduymz/tag-to-label/pkg/provider"
 	"github.com/zduymz/tag-to-label/pkg/utils"
+	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/client-go/kubernetes"
 	"strings"
@@ -31,13 +33,14 @@ const TagNamePrefix = "devops.apixio.com/"
 
 type Controller struct {
 	nodeLister    corelisters.NodeLister
+	podLister     corelisters.PodLister
 	kubeclientset kubernetes.Interface
 	hasSynced     cache.InformerSynced
 	workqueue     workqueue.RateLimitingInterface
 	provider      *provider.AWSProvider
 }
 
-func NewController(nodeInformer coreinformers.NodeInformer, kubeclientset kubernetes.Interface, config *tag_to_label.Config) (*Controller, error) {
+func NewController(nodeInformer coreinformers.NodeInformer, podInformer coreinformers.PodInformer, kubeclientset kubernetes.Interface, config *tag_to_label.Config) (*Controller, error) {
 	klog.Info("Setting up AWS")
 
 	p, err := provider.NewAWSProvider(provider.AWSConfig{
@@ -53,6 +56,7 @@ func NewController(nodeInformer coreinformers.NodeInformer, kubeclientset kubern
 
 	controller := &Controller{
 		nodeLister:    nodeInformer.Lister(),
+		podLister:     podInformer.Lister(),
 		hasSynced:     nodeInformer.Informer().HasSynced,
 		workqueue:     workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "Worker Tag"),
 		provider:      p,
@@ -62,16 +66,11 @@ func NewController(nodeInformer coreinformers.NodeInformer, kubeclientset kubern
 	klog.Info("Setting up event handlers")
 
 	nodeInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc: controller.handleAddObject,
-		//UpdateFunc: func(old, new interface{}) {
-		//	newOne := new.(*corev1.Pod)
-		//	oldOne := old.(*corev1.Pod)
-		//	if newOne.ResourceVersion == oldOne.ResourceVersion {
-		//		return
-		//	}
-		//	controller.handleAddObject(new)
-		//},
-		//DeleteFunc: controller.handleDeleteObject,
+		AddFunc: controller.handleAddNodeObject,
+	})
+
+	podInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc: controller.handleAddPodObject,
 	})
 
 	return controller, nil
@@ -93,9 +92,10 @@ func (c *Controller) Run(stopCh <-chan struct{}) error {
 	klog.Info("[main] Starting worker")
 	go wait.Until(c.runWorker, time.Second, stopCh)
 	klog.Info("[main] Started  worker ")
-	klog.Info("[main] Starting checker")
-	go wait.Until(c.runChecker, 5*time.Minute, stopCh)
-	klog.Info("[main] Started  checker ")
+
+	klog.Info("[main] Starting node checker")
+	go wait.Until(c.runNodeChecker, 5*time.Minute, stopCh)
+	klog.Info("[main] Started node checker ")
 
 	<-stopCh
 	klog.Info("[main] Shutting down worker and checker")
@@ -103,7 +103,7 @@ func (c *Controller) Run(stopCh <-chan struct{}) error {
 }
 
 // Query aws instances to get tags
-func (c *Controller) runChecker() {
+func (c *Controller) runNodeChecker() {
 	klog.Info("[runChecker] Start runChecker")
 	nodes, err := c.nodeLister.List(labels.NewSelector())
 	if err != nil {
@@ -151,6 +151,8 @@ func (c *Controller) runWorker() {
 }
 
 func (c *Controller) processNextWorkItem() bool {
+	// item could be pod or node
+	// pod:<namespace>/<pod_name> node:<node name>
 	obj, shutdown := c.workqueue.Get()
 
 	if shutdown {
@@ -160,17 +162,31 @@ func (c *Controller) processNextWorkItem() bool {
 	// We wrap this block in a func so we can defer c.workqueue.Done.
 	err := func(obj interface{}) error {
 		defer c.workqueue.Done(obj)
-		var key string
+		var item string
 		var ok bool
-		if key, ok = obj.(string); !ok {
+
+		if item, ok = obj.(string); !ok {
 			c.workqueue.Forget(obj)
 			klog.Errorf("[worker] expected string in workqueue but got %#v", obj)
 			return nil
 		}
-		klog.V(4).Infof("[worker] syncHanlder worker %s", key)
-		if err := c.syncHandler(key); err != nil {
-			c.workqueue.AddRateLimited(key)
-			return fmt.Errorf("[worker] Error syncing '%s': %s, Requeuing", key, err.Error())
+
+		key := strings.SplitN(item, ":", 2)
+		klog.Info(key)
+
+		klog.V(4).Infof("[worker] fucking do something %s: %s", key[0], key[1])
+		if key[0] == "pod" {
+			if err := c.podHandler(key[1]); err != nil {
+				c.workqueue.AddRateLimited(item)
+				return err
+			}
+		}
+
+		if key[0] == "node" {
+			if err := c.nodeHandler(key[1]); err != nil {
+				c.workqueue.AddRateLimited(item)
+				return err
+			}
 		}
 
 		c.workqueue.Forget(obj)
@@ -179,22 +195,70 @@ func (c *Controller) processNextWorkItem() bool {
 	}(obj)
 
 	if err != nil {
-		utilruntime.HandleError(err)
+		if err.Error() == "Pod is not running" {
+			klog.V(4).Info(err)
+		} else {
+			utilruntime.HandleError(err)
+		}
 		return true
 	}
 
 	return true
 }
 
-func (c *Controller) syncHandler(key string) error {
-	no, err := c.nodeLister.Get(key)
+func (c *Controller) podHandler(name string) error {
+	namespace, podName, err := cache.SplitMetaNamespaceKey(name)
+	if err != nil {
+		return err
+	}
+	po, err := c.podLister.Pods(namespace).Get(podName)
+	if err != nil {
+		if errors.IsNotFound(err) {
+			klog.Warningf("object %s in workqueue is no longer exists", name)
+			return nil
+		}
+		return err
+	}
+
+	if !c.isPodRunning(po) {
+		klog.Infof("Pod [%s] status : %s ", po.GetName(), po.Status.Phase)
+		return fmt.Errorf("Pod is not running ")
+	}
+
+	no, err := c.nodeLister.Get(po.Spec.NodeName)
+	if err != nil {
+		klog.Warningf("Can not get node [%] info. Reason: %v", err)
+		return err
+	}
+
+	nodeLabels := map[string]string{}
+	for k, v := range no.ObjectMeta.Labels {
+		if strings.HasPrefix(k, "worker") {
+			nodeLabels[k] = v
+		}
+	}
+
+	updateLabels, _ := OuterRightJoin(po.Labels, nodeLabels)
+	if len(updateLabels) > 0 {
+		klog.Infof("[worker] Updating Labels on pod [%s]", podName)
+		err := c.updatePodLabels(namespace, podName, updateLabels)
+		if err != nil {
+			klog.Errorf("[worker] Can not update labels on pod [%s]", podName)
+			return err
+		}
+	}
+	return nil
+}
+
+func (c *Controller) nodeHandler(name string) error {
+	no, err := c.nodeLister.Get(name)
 	if err != nil {
 		return err
 	}
 
 	//TODO: should update labels in other states
 	if !c.isNodeRunning(no) {
-		return fmt.Errorf("node [%s] is not running", no.GetName())
+		return fmt.Errorf("node [%s] is not ready", no.GetName())
 	}
 
 	id, _ := utils.LastinSlice(strings.Split(no.Spec.ProviderID, "/"))
@@ -207,23 +271,14 @@ func (c *Controller) syncHandler(key string) error {
 	// Is it throw error
 	filteredTags := TrimTag(FilterTag(tags)[id])
 
-	klog.Info("Filtered tags: ", filteredTags)
+	klog.V(4).Info("[worker] Filtered tags: ", filteredTags)
 
 	updateLabels, _ := OuterRightJoin(no.Labels, filteredTags)
 	if len(updateLabels) > 0 {
 		klog.Infof("[worker] Updating Labels on node [%s]", no.GetName())
-		//nodeCopy := no.DeepCopy()
-		//for k, v := range updateLabels {
-		//	nodeCopy.Labels[k] = v
-		//}
-		//_, err := c.kubeclientset.CoreV1().Nodes().Update(nodeCopy)
-		//if err != nil {
-		//	klog.Errorf("Can not update labels")
-		//	return err
-		//}
 		err := c.updateNodeLabels(no.GetName(), updateLabels)
 		if err != nil {
-			klog.Errorf("[worker] Can not update labels on node [%s]", no.GetName())
+			klog.Errorf("[worker] Can not update labels on pod [%s]", no.GetName())
 			return err
 		}
 	}
@@ -240,14 +295,31 @@ func (c *Controller) updateNodeLabels(nodeName string, newLabels map[string]stri
 		nodeCopy.Labels[k] = v
 	}
 	// TODO: is it a good to update directly?
-	_, err := c.kubeclientset.CoreV1().Nodes().Update(nodeCopy)
+	ctx := context.Background()
+	_, err := c.kubeclientset.CoreV1().Nodes().Update(ctx, nodeCopy, metav1.UpdateOptions{})
+	return err
+}
+
+func (c *Controller) updatePodLabels(namespace, podName string, newLabels map[string]string) error {
+	po, err := c.podLister.Pods(namespace).Get(podName)
+	if err != nil {
+		klog.Warningf("pod %s is no longer exists", podName)
+		return nil
+	}
+	podCopy := po.DeepCopy()
+	for k, v := range newLabels {
+		podCopy.Labels[k] = v
+	}
+	ctx := context.Background()
+	_, err = c.kubeclientset.CoreV1().Pods(namespace).Update(ctx, podCopy, metav1.UpdateOptions{})
 	return err
 }
 
 // TODO: this step is quite redundant, what tombstone is?
-func (c *Controller) handleAddObject(obj interface{}) {
+func (c *Controller) handleAddNodeObject(obj interface{}) {
 	var object metav1.Object
 	var ok bool
+	// TODO: i don't understand a purpose of this block (just copy and paste)
 	if object, ok = obj.(metav1.Object); !ok {
 		tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
 		if !ok {
@@ -270,7 +342,37 @@ func (c *Controller) handleAddObject(obj interface{}) {
 		klog.Infof("Can not get node [%s] ", object.GetName())
 		return
 	}
-	c.workqueue.Add(no.Name)
+	c.workqueue.Add(fmt.Sprintf("node:%s", no.Name))
+}
+func (c *Controller) handleAddPodObject(obj interface{}) {
+	var object metav1.Object
+	var ok bool
+	if object, ok = obj.(metav1.Object); !ok {
+		tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
+		if !ok {
+			klog.Errorf("error decoding object, invalid type")
+			return
+		}
+		object, ok = tombstone.Obj.(metav1.Object)
+		if !ok {
+			klog.Errorf("error decoding object tombstone, invalid type")
+			return
+		}
+		klog.Infof("Recovered deleted object '%s' from tombstone", object.GetName())
+	}
+
+	if object.GetNamespace() != "default" {
+		return
+	}
+
+	klog.V(4).Infof("Processing object: %s", object.GetName())
+
+	key, err := cache.MetaNamespaceKeyFunc(obj)
+	if err != nil {
+		klog.V(4).Infof("handleAddPodObject [%s] failed. Reason: %v", object.GetName(), err)
+		return
+	}
+	c.workqueue.Add(fmt.Sprintf("pod:%s", key))
 }
 
 func (c *Controller) isNodeRunning(no *corev1.Node) bool {
@@ -280,6 +382,12 @@ func (c *Controller) isNodeRunning(no *corev1.Node) bool {
 		}
 	}
 	return false
+}
+func (c *Controller) isPodRunning(pod *corev1.Pod) bool {
+	if podStatus := pod.Status.Phase; podStatus != corev1.PodRunning {
+		return false
+	}
+	return true
 }
 
 func OuterRightJoin(left, right map[string]string) (map[string]string, error) {
